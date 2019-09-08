@@ -3,6 +3,8 @@ import pyrealsense2 as rs
 import cv2 as cv
 import imutils
 import random
+import math
+import logging
 
 # all coordinates are represented in row, column basis
 '''
@@ -29,19 +31,24 @@ getScene(pipeline, manual = False, field = None)
 '''
 
 class scene():
-    robot_template = cv.imread('robot_template.jpg')
-    robot_template = cv.resize(robot_template, (0, 0), fx = 0.5, fy = 0.5, interpolation =  cv.INTER_AREA)
-
     orb = cv.ORB_create()
-    robot_kp, robot_des = orb.detectAndCompute(robot_template, None)
-
+    '''
     FLANN_INDEX_LSH = 6
     index_params = dict(algorithm = FLANN_INDEX_LSH, table_number = 6, key_size = 12, multi_probe_level = 1)
     search_params = dict(checks = 50)
     flann = cv.FlannBasedMatcher(index_params, search_params)
+    '''
+    bf = cv.BFMatcher_create(cv.NORM_HAMMING, crossCheck = True)
 
-    MIN_MATCH_COUNT = 15
+    MIN_MATCH_COUNT = 20
     factor = 0.7
+
+    redUp_1 = (20, 255, 255)
+    redLo_1 = (0, 40, 40)
+    redUp_2 = (180, 255, 255)
+    redLo_2 = (160, 40, 40)
+    bluUp = (140, 255, 255)
+    bluLo = (100, 40, 40)
 
     def __init__(self, color):
         self.color = color
@@ -88,65 +95,77 @@ class scene():
             thing.kp, thing.des = scene.orb.detectAndCompute(self.color, thing.mask)
 
     def findRobot(self):
-        good_dict = {}
         for key in self.things:
             thing_temp = self.things[key]
-            try: matches = scene.flann.knnMatch(thing_self.des, scene.robot_des, k = 2)
-            except: continue
 
-            good = []
-            for match in matches:
-                if len(match) != 2: continue
-                else:
-                    m, n = match
-                    if m.distance < scene.factor * n.distance:
-                        good.append(m)
-            good_dict[key] = good
+            redMask = cv.inRange(thing_temp.image_hsv, scene.redLo_1, scene.redUp_1) + cv.inRange(thing_temp.image_hsv, scene.redLo_2, scene.redUp_2)
+            bluMask = cv.inRange(thing_temp.image_hsv, scene.bluLo, scene.bluUp)
 
-        key, val = max(good_dict.items(), key = lambda x: len(x[1]))
-        if val > scene.MIN_MATCH_COUNT:
-            robot_good = good_dict[key]
-            things_temp['ROBOT'] = things_temp.pop(key)
-        
-        self.things = things_temp
+            MIN_AREA = 50
+            red_temp = cv.findContours(redMask, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
+            red_temp = imutils.grab_contours(red_temp)
+            redCnts = []
+            for cnt in red_temp:
+                a = cv.contourArea(cnt)
+                if a > MIN_AREA:
+                    redCnts.append(cnt)
+            blu_temp = cv.findContours(bluMask, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
+            blu_temp = imutils.grab_contours(blu_temp)
+            bluCnts = []
+            for cnt in blu_temp:
+                a = cv.contourArea(cnt)
+                if a > MIN_AREA:
+                    bluCnts.append(cnt)
 
-        src_pts = np.float32([scene.robot_kp[m.queryIdx].pt for m in robot_good ]).reshape(-1,1,2)
-        dst_pts = np.float32([self.things['ROBOT'].kp[m.trainIdx].pt for m in robot_good ]).reshape(-1,1,2)
-        
-        sample_num = 10
-        angle = 0
-        for _ in range(sample_num):
-            src = random.sample(src_pts, 3)
-            dst = random.sample(dst_pts, 3)
+            if len(redCnts) == 1 and len(bluCnts) == 1:
+                self.things['ROBOT'] = self.things.pop(key)
 
-            mtx = cv.getAffineTransform(src, dst)
-            angle += decomposeAffineMtx(mtx)
-        return angle / sample_num
+                redCnt = redCnts[0]
+                bluCnt = bluCnts[0]
 
+                red_m = cv.moments(redCnt)
+                red_cX = int(red_m['m10'] / red_m['m00'])
+                red_cY = int(red_m['m01'] / red_m['m00'])
+                blu_m = cv.mements(bluCnt)
+                blu_cX = int(blu_m['m10'] / blu_m['m00'])
+                blu_cY = int(blu_m['m01'] / blu_m['m00'])
+
+                dX = blu_cX - red_cX
+                dY = blu_cY - red_cY
+                angle = math.atan2(dY, dX)
+                
+                return angle
+
+        try:
+            thing_temp = self.things['ROBOT']
+        except KeyError:
+            logging.info("ERROR: ROBOT NOT FOUND")
 
     def compare(self, other):
         things_temp = {}
-        good = {}
+        dist_dict = {}
         for key_self in self.things:
+            if key_self == 'ROBOT': continue
             thing_self = self.things[key_self]
+
             for key_other in other.things:
+                if key_other == 'ROBOT': continue
                 thing_other = other.things[key_other]
 
-                try: matches = scene.flann.knnMatch(thing_self.des, thing_other.des, k = 2)
+                try: matches = scene.bf.match(thing_self.des, thing_other.des)
                 except: continue
 
-                cnt = 0
-                for match in matches:
-                    if len(match) != 2: continue
-                    else:
-                        m, n = match
-                        if m.distance < scene.factor * n.distance:
-                            cnt += 1
-                good[key_other] = cnt
+                if len(matches) < scene.MIN_MATCH_COUNT:
+                    continue
 
-            key, val = max(good.items(), key = lambda x: x[1])
-            if val > scene.MIN_MATCH_COUNT:
-                things_temp[key_self] = other.things[key]
+                dist = 0
+                for match in matches[:scene.MIN_MATCH_COUNT]
+                    dist += match.distance
+                dist_dict[key_other] = dist
+
+
+            key, val = min(dist_dict.items(), key = lambda x: x[1])
+            things_temp[key_self] = other.things[key]
 
         other.things = things_temp
 
@@ -160,6 +179,7 @@ class thing():
         self.mask = np.zeros(scene.gray.shape, np.uint8)
         cv.drawContours(self.mask, [contour], -1, 255, -1)
         self.image = cv.bitwise_and(scene.color, scene.color, mask = self.mask)
+        self.image_hsv = cv.cvtColor(self.image, cv.COLOR_BGR2HSV)
 
 def getScene(pipeline, manual = False, field = None):
     if manual:
@@ -185,18 +205,6 @@ def getScene(pipeline, manual = False, field = None):
             # field = (corners, fieldShape)
             color = mapField(color, field)
         return scene(color)
-
-def decomposeAffineMtx(affine):
-    trans = np.int32(affine[:, 2])
-    scale = [0, 0]
-    scale[0] = math.sqrt(affine[0, 0] ** 2 + affine[1, 0] ** 2)
-    scale[1] = math.sqrt(affine[0, 1] ** 2 + affine[1, 1] ** 2)
-    cos = affine[0, 0] / scale[0]
-    sin = affine[1, 0] / scale[0]
-    angle = math.atan2(sin, cos)
-    angle = math.degrees(angle)
-
-    return angle
 
 '''
 grid
